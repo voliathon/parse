@@ -8,7 +8,7 @@
 ]]
 
 -- Addon metadata
-_addon.version = '1.0.1'
+_addon.version = '2.0.1'
 _addon.name = 'Parse'
 _addon.author = 'Flippant(Original) & Voliathon(New)'
 _addon.commands = {'parse','p'}
