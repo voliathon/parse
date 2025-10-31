@@ -1,99 +1,146 @@
---[[ TO DO
+--[[
+    Copyright (c) 2016-2023, Flippant
+    Copyright (c) 2025, Voliathon
+    All rights reserved.
 
-	-- Update filter header directly
-
+    This source code is licensed under the BSD-style license found in the
+    LICENSE.md file in the root directory of this source tree.
 ]]
 
+---
+-- Initializes all text boxes defined in the settings file.
+--
 function init_boxes()
 	for box,__ in pairs(settings.display) do
 		create_text(box)
 	end
 end
 
+---
+-- Creates a single new text box object based on its name.
+-- @param stat_type {string} The name of the display box (e.g., 'melee', 'defense').
+--
 function create_text(stat_type)
 	local t_settings = settings.display[stat_type]
 
+    -- Create a new text object using the settings
     text_box[stat_type] = texts.new(t_settings)
-	text_box[stat_type]:hide()
-	update_text(text_box[stat_type])
+	text_box[stat_type]:hide() -- Hide it by default
+	update_text(stat_type) -- Populate it with initial data (or "No data")
 end
 
+---
+-- The main update function for a single display box.
+-- Gathers all data, sorts players, and formats the text.
+-- (This function is now optimized to loop the database only once).
+-- @param stat_type {string} The name of the display box to update.
+--
 function update_text(stat_type)    
-	-- Don't update if box wasn't properly added, there are no settings, or it is not set to visible
+	-- Don't update if box doesn't exist, has no settings, is hidden, or player is not logged in.
 	if not text_box[stat_type] or not settings.display[stat_type] or not settings.display[stat_type].visible or not windower.ffxi.get_info().logged_in then
 		return
 	end
 
+	-- info: Holds the final formatted string for each player
+    -- head: Holds the header lines (title, filters, stats)
+    -- to_be_sorted: A temporary table {player_name = sort_value} used for sorting
+    -- sorted_players: The final list of player names in the correct order
 	local info = {}
 	local head = L{}
 	local to_be_sorted = {}
 	local sorted_players = L{}
-	local all_damage = 0
 	
+	-- === 1. Prepare Data (THE OPTIMIZATION) ===
+	-- Call collapse_mobs() ONCE. This loops the main database and returns a
+	-- simple, player-centric table. This is fast.
+	local collapsed_db = collapse_mobs()
+	
+	-- Get the total parse damage ONCE from the new collapsed table.
+	local total_parse_damage = get_total_parse_damage(collapsed_db)
+	
+	-- Determine what to sort by, based on the box's 'type' in settings
+	local sort_type
 	if settings.display[stat_type]["type"] == "offense" then 
 		sort_type = "damage" 
 	else 
 		sort_type = "defense" 
 	end
 
-	-- add data to info table
-	for __,player_name in pairs(get_players()) do		
-
-		if (settings.display and settings.display[stat_type]) then
-			to_be_sorted[player_name] = get_player_stat_tally('parry',player_name) + get_player_stat_tally('hit',player_name) + get_player_stat_tally('evade',player_name)
+	-- === 2. Gather and Pre-Sort Data ===
+	-- Loop the *collapsed database* (which is small), NOT the main database.
+	if collapsed_db then
+		for player_name, player_data in pairs(collapsed_db) do		
+			-- Get the sort value for this player
+			if sort_type == "damage" then
+				to_be_sorted[player_name] = player_data.total_damage or 0
+			else -- defense
+				to_be_sorted[player_name] = fast_get_tally(player_data, 'parry') + fast_get_tally(player_data, 'hit') + fast_get_tally(player_data, 'evade')
+			end
+			
+			-- Start the player's line with their formatted name
 			info[player_name] = '\\cs('..label_colors('player')..')'..string.format('%-13s',player_name..' ')..'\\cr' 
+			
+			-- Iterate over each stat this box is configured to show
 			for stat in settings.display[stat_type].order:it() do 
 				if settings.display[stat_type].data_types[stat] then					
-					local d = {}					
+					local d = {} -- Holds the data for this single stat
+					
+					-- Iterate over the data types for that stat (e.g., 'total', 'avg', 'percent')
 					for report_type,__ in pairs(settings.display[stat_type].data_types[stat]) do
+						-- === Call the NEW FAST functions ===
+						-- These functions just read from player_data, they DO NOT loop the database.
 						if report_type=="total" then
-							local total = get_player_damage(player_name) -- getting player's damage
-							d[report_type] = total or "--"
-							all_damage = all_damage + total
-							if sort_type=='damage' then to_be_sorted[player_name] = total end
+							local total = player_data.total_damage or 0
+							d[report_type] = total
 						elseif report_type=="total-percent" then
-							d[report_type] = get_player_stat_percent(stat,player_name) or "--"
-							--d[report_type] = (total or get_player_damage(player_name)) / get_player_damage() or "--"
+							d[report_type] = fast_get_percent(player_data, stat, total_parse_damage) or "--"
 						elseif report_type=="avg" then
-							d[report_type] = get_player_stat_avg(stat,player_name) or "--" 
+							d[report_type] = fast_get_avg(player_data, stat) or "--" 
 						elseif report_type=="percent" then
-							d[report_type] = get_player_stat_percent(stat,player_name) or "--"
+							d[report_type] = fast_get_percent(player_data, stat, total_parse_damage) or "--"
 						elseif report_type=="tally" then
-							d[report_type] = get_player_stat_tally(stat,player_name) or "--"
+							d[report_type] = fast_get_tally(player_data, stat) or "--"
 						elseif report_type=="damage" then
-							d[report_type] = get_player_stat_damage(player_name) or "--"
+							d[report_type] = fast_get_damage(player_data, stat) or "--"
 						else
 							d[report_type] = "--"
 						end											
 					end
+					-- Format and append the data for this stat
 					info[player_name] = info[player_name] .. (format_display_data(d))	
 				end
 			end
 		end
 	end
 	
-	-- sort players
+	-- === 3. Sort Players ===
+    -- This is a simple N-pass selection sort to get the top 'max' players
 	for i=1,settings.display[stat_type].max,+1 do
 		p_name = nil
 		top_result = 0
 		for player_name,sort_num in pairs(to_be_sorted) do
+            -- Find the player with the highest sort_num who isn't already in the sorted list
 			if sort_num > top_result and not sorted_players:contains('${'..player_name..'}') then
 				top_result = sort_num
 				p_name = player_name					
 			end						
 		end	
+        -- Add the top player found in this pass to the list
 		if p_name then sorted_players:append('${'..p_name..'}') end		
 	end
 
+	-- === 4. Assemble Header ===
+    -- Add the title, filters, and pause status
 	head:append('[ ${title} ] ${filters} ${pause}')
-	info['title'] = stat_type
+	info['title'] = stat_type -- The text object will replace ${title} with this
 
-	info['filters'] = update_filters()
+	info['filters'] = update_filters() -- Add filter string
 	
 	if pause then
-		info['pause'] = "- PARSE PAUSED -"
+		info['pause'] = "- PARSE PAUSED -" -- Add pause status
 	end
 
+    -- Add the stat column headers (e.g., "  damage   melee    ws  ")
 	head:append('${header}')
 	info['header'] = format_display_head(stat_type)
 
@@ -101,35 +148,47 @@ function update_text(stat_type)
 		head:append('No data found')
 	end
 	
+	-- === 5. Update the Text Box Object ===
 	if text_box[stat_type] then
-		text_box[stat_type]:clear()
-		text_box[stat_type]:append(head:concat('\n'))
-		text_box[stat_type]:append('\n')
-		text_box[stat_type]:append(sorted_players:concat('\n'))	
-		text_box[stat_type]:update(info)
+		text_box[stat_type]:clear() -- Clear all existing text
+		text_box[stat_type]:append(head:concat('\n')) -- Add the header lines
+		text_box[stat_type]:append('\n') -- Add a blank line
+		text_box[stat_type]:append(sorted_players:concat('\n')) -- Add the list of sorted player names
+		text_box[stat_type]:update(info) -- Pass the 'info' table to resolve all variables (e.t., ${title}, ${player_name})
 		
 		if settings.display[stat_type].visible then
-			text_box[stat_type]:show()
+			text_box[stat_type]:show() -- Ensure it's visible
 		end
 	end
-
 end
 
+---
+-- Formats the header row (the stat names) with correct spacing.
+-- @param box_name {string} The name of the display box.
+-- @return {string} A formatted string of stat names.
+--
 function format_display_head(box_name)
-	local text = string.format('%-13s',' ')
+	local text = string.format('%-13s',' ') -- Initial padding to align with player names
 	for stat in settings.display[box_name].order:it() do
 		if settings.display[box_name].data_types[stat] then
-			characters = 0
+			local characters = 0
+            -- Calculate the width of the column based on the data types it will show
 			for i,v in pairs(settings.display[box_name].data_types[stat]) do
 				characters = characters + 7
-				if i=='total' then characters = characters +1 end
+				if i=='total' then characters = characters + 1 end -- 'total' is a bit wider
 			end
+            -- Create the formatted, fixed-width stat name
 			text = text .. '\\cs('..label_colors('stat')..')' .. string.format('%-'..characters..'s',stat) .. '\\cr'
 		end
 	end
 	return text
 end
 
+---
+-- Helper function to get the RGB color string for labels from settings.
+-- @param label {string} The label type ('player' or 'stat').
+-- @return {string} A string formatted as "r,g,b".
+--
 function label_colors(label)
 	local r, b, g = 255, 255, 255
 	
@@ -142,6 +201,12 @@ function label_colors(label)
 	return tostring(r)..','..tostring(g)..','..tostring(b)
 end
 
+---
+-- Formats the data for a single stat into a fixed-width string.
+-- The order of 'if' statements determines the column order.
+-- @param data {table} A table of data, e.g., {total=1000, "total-percent"=10.5}.
+-- @return {string} The formatted string for that stat.
+--
 function format_display_data(data)
 	line = ""
 	
@@ -173,13 +238,21 @@ function format_display_data(data)
 	return line
 end
 
+---
+-- A global refresh function that calls update_text() on all active boxes.
+-- This is looped by the main parse.lua 'config.register' callback.
+--
 function update_texts()
 	for v,__ in pairs(text_box) do
 		update_text(v)
 	end
 end
 
--- I want this to edit the text boxes directly
+---
+-- Gets a string representation of the currently active filters.
+-- This is used by update_text() to display filter status in the box header.
+-- @return {string} The filter status string.
+--
 function update_filters()
 	local text = ""
 	if filters['mob'] and filters['mob']:tostring()~="{}" then
@@ -190,30 +263,3 @@ function update_filters()
 	end
 	return text
 end
-
-
---Copyright (c) 2013~2016, F.R
---All rights reserved.
-
---Redistribution and use in source and binary forms, with or without
---modification, are permitted provided that the following conditions are met:
-
---    * Redistributions of source code must retain the above copyright
---      notice, this list of conditions and the following disclaimer.
---    * Redistributions in binary form must reproduce the above copyright
---      notice, this list of conditions and the following disclaimer in the
---      documentation and/or other materials provided with the distribution.
---    * Neither the name of <addon name> nor the
---      names of its contributors may be used to endorse or promote products
---      derived from this software without specific prior written permission.
-
---THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
---ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
---WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
---DISCLAIMED. IN NO EVENT SHALL <your name> BE LIABLE FOR ANY
---DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
---(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
---LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
---ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
---(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
---SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
